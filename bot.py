@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import asyncio
 import logging
 import httpx
@@ -15,31 +14,108 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def parse_report(text):
+def normalize(text):
+    text = text.replace("\u2014", "-").replace("\u2013", "-").replace("\u2212", "-")
+    text = re.sub(r'\s*-\s*', ' - ', text)
+    return text
+
+
+def parse_report(raw_text):
     data = {}
-    patterns = {
-        "план":                r"план[^\d]*(\d[\d\s]*)",
-        "выручка":             r"общая\s*выручка[^\d]*(\d[\d\s]*)",
-        "наличные":            r"наличные[^\d]*(\d[\d\s]*)",
-        "переводы":            r"переводы[^\d]*(\d[\d\s]*)",
-        "qr":                  r"qr\s*code[^\d]*(\d[\d\s]*)",
-        "рассрочка":           r"рассрочка[^\d]*(\d[\d\s]*)",
-        "счет":                r"оплата\s*по\s*счет[уу][^\d]*(\d[\d\s]*)",
-        "терминал":            r"терминал[^\d]*(\d[\d\s]*)",
-        "сдача":               r"сдача[^\d]*(\d[\d\s]*)",
-        "наличных_в_магазине": r"наличных\s*в\s*магазине[^\d]*(\d[\d\s]*)",
-    }
+    text = normalize(raw_text)
     text_lower = text.lower()
-    for key, pattern in patterns.items():
-        match = re.search(pattern, text_lower)
-        if match:
-            value = match.group(1).replace(" ", "")
-            try:
-                data[key] = int(value)
-            except ValueError:
-                pass
+
+    finance_patterns = {
+        "план": [
+            r"план - ([\d\s]+)₽",
+            r"план[^\d]*([\d][\d\s]*)",
+        ],
+        "выручка": [
+            r"общая\s*(?:сумма|выручка) - ([\d\s]+)",
+            r"\d+\)\s*общая\s*(?:сумма|выручка)[^\d]*([\d\s]+)",
+        ],
+        "наличные": [
+            r"\d+\)\s*наличные - ([\d\s]+)",
+            r"наличные - ([\d\s]+)",
+        ],
+        "переводы": [
+            r"\d+\)\s*переводы? - ([\d\s]+)",
+            r"переводы? - ([\d\s]+)",
+        ],
+        "qr": [
+            r"\d+\)\s*qr[\s-]*код - ([\d\s]+)",
+            r"qr[\s-]*код - ([\d\s]+)",
+        ],
+        "рассрочка": [
+            r"\d+\)\s*рассрочка - ([\d\s]+)",
+            r"рассрочка - ([\d\s]+)",
+        ],
+        "счет": [
+            r"\d+\)\s*оплата\s*по\s*счет[уу] - ([\d\s]+)",
+            r"оплата\s*по\s*счет[уу][^\d]*([\d\s]+)",
+        ],
+        "терминал": [
+            r"\d+\)\s*терминал - ([\d\s]+)",
+            r"терминал - ([\d\s]+)",
+        ],
+        "сдача": [
+            r"сдача - ([\d\s]+)",
+        ],
+        "наличных_в_магазине": [
+            r"наличных\s*в\s*магазине - ([\d\s]+)",
+        ],
+    }
+
+    for key, patterns in finance_patterns.items():
+        for pattern in patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                value = match.group(1).replace(" ", "").replace("₽", "").strip()
+                try:
+                    data[key] = int(value)
+                    break
+                except ValueError:
+                    pass
+
+    stat_patterns = {
+        "продаж":      [r"[•\*]\s*продаж[:\s]*(\d+)", r"продаж[:\s]*(\d+)"],
+        "броней":      [r"[•\*]\s*броней[:\s]*(\d+)", r"броней[:\s]*(\d+)"],
+        "предзаказов": [r"[•\*]\s*предзаказов[:\s]*(\d+)", r"предзаказов[:\s]*(\d+)"],
+    }
+    for key, patterns in stat_patterns.items():
+        for pattern in patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                try:
+                    data[key] = int(match.group(1))
+                    break
+                except ValueError:
+                    pass
+
+    out_match = re.search(
+        r"закончил(?:ись|ся)\s*товары?[:\.\s]*(.*?)(?=\n\n|\d+[\.\)]|\Z)",
+        raw_text, re.DOTALL | re.IGNORECASE
+    )
+    if out_match:
+        data["закончились"] = out_match.group(1).strip()
+
+    asked_match = re.search(
+        r"спросили?\s*сегодня[:\s]*(.*?)(?=\n\n|\d+[\.\)]|📊|\Z)",
+        raw_text, re.DOTALL | re.IGNORECASE
+    )
+    if asked_match:
+        data["спрашивали"] = asked_match.group(1).strip()
+
+    comment_match = re.search(
+        r"(?:^|\n)2[\.\)]\s*(.*?)(?=\n\n|\n\d+[\.\)]|спросили?|📊|\Z)",
+        raw_text, re.DOTALL | re.IGNORECASE
+    )
+    if comment_match:
+        data["комментарий"] = comment_match.group(1).strip()
+
     if "выручка" not in data:
         return None
+
     return data
 
 
@@ -61,10 +137,30 @@ def format_note(data, author, raw_text):
         f"# 📊 Отчёт за {today}",
         f"**Менеджер:** {author}",
         f"**Время:** {now}",
-        "",
-        "---",
-        "",
-        "## 💰 Финансы",
+        "", "---", "",
+    ]
+
+    if data.get("закончились"):
+        lines += ["## 📦 Закончились товары", "", data["закончились"], "", "---", ""]
+
+    if data.get("комментарий"):
+        lines += ["## 💬 Как прошёл день", "", data["комментарий"], "", "---", ""]
+
+    if data.get("спрашивали"):
+        lines += ["## ❓ Спрашивали, но не было", "", data["спрашивали"], "", "---", ""]
+
+    if any(k in data for k in ["продаж", "броней", "предзаказов"]):
+        lines += ["## 📈 Статистика", "", "| Показатель | Значение |", "|------------|----------|"]
+        if "предзаказов" in data:
+            lines.append(f"| Предзаказов | {data['предзаказов']} |")
+        if "броней" in data:
+            lines.append(f"| Броней | {data['броней']} |")
+        if "продаж" in data:
+            lines.append(f"| Продаж | {data['продаж']} |")
+        lines += ["", "---", ""]
+
+    lines += [
+        "## 💰 Итоги по кассе",
         "",
         "| Метрика | Сумма |",
         "|---------|-------|",
@@ -79,13 +175,12 @@ def format_note(data, author, raw_text):
         f"| Оплата по счёту | {fmt(data.get('счет'))} |",
         f"| Сдача | {fmt(data.get('сдача'))} |",
         f"| Наличных в магазине | {fmt(data.get('наличных_в_магазине'))} |",
-        "",
-        "---",
-        "",
-        "## 📝 Полный отчёт",
+        "", "---", "",
+        "## 📝 Исходный отчёт",
         "",
         raw_text,
     ]
+
     return "\n".join(lines)
 
 
@@ -126,7 +221,10 @@ async def process_update(update):
     text = message.get("text", "")
     chat_id = message.get("chat", {}).get("id")
     user = message.get("from", {})
-    author = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get("username", "Неизвестно")
+    author = (
+        f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+        or user.get("username", "Неизвестно")
+    )
 
     if not text or not chat_id:
         return
@@ -147,17 +245,23 @@ async def process_update(update):
     процент = round(выручка / план * 100) if план > 0 else 0
     статус = "✅" if процент >= 100 else "⚠️" if процент >= 80 else "🔴"
     выручка_fmt = f"{выручка:,}".replace(",", " ")
+    продаж = data.get("продаж", "—")
 
-    if success:
-        reply = f"📥 Отчёт сохранён в Obsidian\n👤 {author}\n💰 Выручка: {выручка_fmt} ₽\n📊 План: {процент}% {статус}"
-    else:
-        reply = f"📋 Отчёт получен\n👤 {author}\n💰 Выручка: {выручка_fmt} ₽\n📊 План: {процент}% {статус}\n⚠️ Obsidian недоступен"
+    obsidian_status = "📥 Сохранён в Obsidian" if success else "⚠️ Obsidian недоступен"
+
+    reply = (
+        f"📋 Отчёт принят | {obsidian_status}\n"
+        f"👤 {author}\n"
+        f"💰 Выручка: {выручка_fmt} ₽\n"
+        f"📊 План: {процент}% {статус}\n"
+        f"🛒 Продаж: {продаж}"
+    )
 
     await send_message(chat_id, reply)
 
 
 async def main():
-    logger.info("✅ NextApple бот запущен (long polling)...")
+    logger.info("✅ NextApple бот запущен...")
     offset = None
     while True:
         try:

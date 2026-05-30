@@ -1,183 +1,192 @@
-import os
+Request
+
+{
+  "content": "import os
 import re
+import json
+import asyncio
 import logging
 import httpx
 from datetime import datetime
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-# ─── Настройки ────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-OBSIDIAN_API_KEY = os.environ["OBSIDIAN_API_KEY"]
-# HTTP порт — включи в Obsidian: Settings → Local REST API → Enable HTTP server
-OBSIDIAN_URL = os.environ.get("OBSIDIAN_URL", "http://127.0.0.1:27123")
+TELEGRAM_TOKEN = os.environ[\"TELEGRAM_TOKEN\"]
+OBSIDIAN_API_KEY = os.environ[\"OBSIDIAN_API_KEY\"]
+OBSIDIAN_URL = os.environ.get(\"OBSIDIAN_URL\", \"http://127.0.0.1:27123\")
+TELEGRAM_API = f\"https://api.telegram.org/bot{TELEGRAM_TOKEN}\"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─── Парсинг отчёта менеджера ──────────────────────────────────────────────────
-def parse_report(text: str) -> dict | None:
-    """
-    Парсит ежедневный отчёт менеджера.
-    Формат (из Задачи сотрудников.md):
-        План - 500000
-        Общая выручка - 320000
-        Наличные - 150000
-        Переводы - 100000
-        QR code - 50000
-        Рассрочка - 20000
-        Оплата по счету - 0
-        Терминал - 0
-        Сдача - 3000
-        Наличных в магазине - 147000
-    """
+
+def parse_report(text):
     data = {}
     patterns = {
-        "план":               r"план[^\d]*(\d[\d\s]*)",
-        "выручка":            r"общая\s*выручка[^\d]*(\d[\d\s]*)",
-        "наличные":           r"наличные[^\d]*(\d[\d\s]*)",
-        "переводы":           r"переводы[^\d]*(\d[\d\s]*)",
-        "qr":                 r"qr\s*code[^\d]*(\d[\d\s]*)",
-        "рассрочка":          r"рассрочка[^\d]*(\d[\d\s]*)",
-        "счет":               r"оплата\s*по\s*счет[уу][^\d]*(\d[\d\s]*)",
-        "терминал":           r"терминал[^\d]*(\d[\d\s]*)",
-        "сдача":              r"сдача[^\d]*(\d[\d\s]*)",
-        "наличных_в_магазине":r"наличных\s*в\s*магазине[^\d]*(\d[\d\s]*)",
+        \"план\":                r\"план[^\\d]*(\\d[\\d\\s]*)\",
+        \"выручка\":             r\"общая\\s*выручка[^\\d]*(\\d[\\d\\s]*)\",
+        \"наличные\":            r\"наличные[^\\d]*(\\d[\\d\\s]*)\",
+        \"переводы\":            r\"переводы[^\\d]*(\\d[\\d\\s]*)\",
+        \"qr\":                  r\"qr\\s*code[^\\d]*(\\d[\\d\\s]*)\",
+        \"рассрочка\":           r\"рассрочка[^\\d]*(\\d[\\d\\s]*)\",
+        \"счет\":                r\"оплата\\s*по\\s*счет[уу][^\\d]*(\\d[\\d\\s]*)\",
+        \"терминал\":            r\"терминал[^\\d]*(\\d[\\d\\s]*)\",
+        \"сдача\":               r\"сдача[^\\d]*(\\d[\\d\\s]*)\",
+        \"наличных_в_магазине\": r\"наличных\\s*в\\s*магазине[^\\d]*(\\d[\\d\\s]*)\",
     }
-
     text_lower = text.lower()
     for key, pattern in patterns.items():
         match = re.search(pattern, text_lower)
         if match:
-            value = match.group(1).replace(" ", "")
+            value = match.group(1).replace(\" \", \"\")
             try:
                 data[key] = int(value)
             except ValueError:
                 pass
-
-    # Нужна хотя бы выручка — иначе не отчёт
-    if "выручка" not in data:
+    if \"выручка\" not in data:
         return None
-
     return data
 
 
-# ─── Формат Markdown для Obsidian ─────────────────────────────────────────────
-def format_note(data: dict, author: str, raw_text: str) -> str:
-    today = datetime.now().strftime("%d.%m.%Y")
-    now = datetime.now().strftime("%H:%M")
+def fmt(val):
+    if isinstance(val, int):
+        return f\"{val:,}\".replace(\",\", \" \") + \" ₽\"
+    return \"—\"
 
-    выручка = data.get("выручка", 0)
-    план = data.get("план", 0)
+
+def format_note(data, author, raw_text):
+    today = datetime.now().strftime(\"%d.%m.%Y\")
+    now = datetime.now().strftime(\"%H:%M\")
+    выручка = data.get(\"выручка\", 0)
+    план = data.get(\"план\", 0)
     процент = round(выручка / план * 100) if план > 0 else 0
-    статус = "✅" if процент >= 100 else "⚠️" if процент >= 80 else "🔴"
-
-    def fmt(val):
-        return f"{val:,}".replace(",", " ") + " ₽" if isinstance(val, int) else "—"
+    статус = \"✅\" if процент >= 100 else \"⚠️\" if процент >= 80 else \"🔴\"
 
     lines = [
-        f"# 📊 Отчёт за {today}",
-        f"**Менеджер:** {author}  ",
-        f"**Время:** {now}",
-        "",
-        "---",
-        "",
-        "## 💰 Финансы",
-        "",
-        "| Метрика | Сумма |",
-        "|---------|-------|",
-        f"| Общая выручка | {fmt(выручка)} |",
-        f"| План | {fmt(план)} |",
-        f"| Выполнение | {процент}% {статус} |",
-        f"| Наличные | {fmt(data.get('наличные', '—'))} |",
-        f"| Переводы | {fmt(data.get('переводы', '—'))} |",
-        f"| QR code | {fmt(data.get('qr', '—'))} |",
-        f"| Рассрочка | {fmt(data.get('рассрочка', '—'))} |",
-        f"| Терминал | {fmt(data.get('терминал', '—'))} |",
-        f"| Оплата по счёту | {fmt(data.get('счет', '—'))} |",
-        f"| Сдача | {fmt(data.get('сдача', '—'))} |",
-        f"| Наличных в магазине | {fmt(data.get('наличных_в_магазине', '—'))} |",
-        "",
-        "---",
-        "",
-        "## 📝 Полный отчёт",
-        "",
+        f\"# 📊 Отчёт за {today}\",
+        f\"**Менеджер:** {author}\",
+        f\"**Время:** {now}\",
+        \"\",
+        \"---\",
+        \"\",
+        \"## 💰 Финансы\",
+        \"\",
+        \"| Метрика | Сумма |\",
+        \"|---------|-------|\",
+        f\"| Общая выручка | {fmt(выручка)} |\",
+        f\"| План | {fmt(план)} |\",
+        f\"| Выполнение | {процент}% {статус} |\",
+        f\"| Наличные | {fmt(data.get('наличные'))} |\",
+        f\"| Переводы | {fmt(data.get('переводы'))} |\",
+        f\"| QR code | {fmt(data.get('qr'))} |\",
+        f\"| Рассрочка | {fmt(data.get('рассрочка'))} |\",
+        f\"| Терминал | {fmt(data.get('терминал'))} |\",
+        f\"| Оплата по счёту | {fmt(data.get('счет'))} |\",
+        f\"| Сдача | {fmt(data.get('сдача'))} |\",
+        f\"| Наличных в магазине | {fmt(data.get('наличных_в_магазине'))} |\",
+        \"\",
+        \"---\",
+        \"\",
+        \"## 📝 Полный отчёт\",
+        \"\",
         raw_text,
     ]
+    return \"\
+\".join(lines)
 
-    return "\n".join(lines)
 
-
-# ─── Сохранение в Obsidian через Local REST API ────────────────────────────────
-async def save_to_obsidian(note_content: str, filepath: str) -> bool:
-    """
-    PUT /vault/{path} — создаёт или перезаписывает файл.
-    Документация: https://coddingtonbear.github.io/obsidian-local-rest-api/
-    """
-    url = f"{OBSIDIAN_URL}/vault/{filepath}"
+async def save_to_obsidian(content, filepath):
+    url = f\"{OBSIDIAN_URL}/vault/{filepath}\"
     headers = {
-        "Authorization": f"Bearer {OBSIDIAN_API_KEY}",
-        "Content-Type": "text/markdown",
+        \"Authorization\": f\"Bearer {OBSIDIAN_API_KEY}\",
+        \"Content-Type\": \"text/markdown\",
     }
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.put(
-                url,
-                content=note_content.encode("utf-8"),
-                headers=headers
-            )
-            logger.info(f"Obsidian API response: {response.status_code}")
-            return response.status_code in (200, 201, 204)
+            r = await client.put(url, content=content.encode(\"utf-8\"), headers=headers)
+            return r.status_code in (200, 201, 204)
     except Exception as e:
-        logger.error(f"Ошибка Obsidian API: {e}")
+        logger.error(f\"Obsidian error: {e}\")
         return False
 
 
-# ─── Обработчик сообщений ──────────────────────────────────────────────────────
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message or not message.text:
-        return
+async def send_message(chat_id, text):
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(f\"{TELEGRAM_API}/sendMessage\", json={
+            \"chat_id\": chat_id,
+            \"text\": text,
+        })
 
-    text = message.text
-    author = message.from_user.full_name or message.from_user.username or "Неизвестно"
+
+async def get_updates(offset=None):
+    params = {\"timeout\": 30, \"allowed_updates\": [\"message\"]}
+    if offset:
+        params[\"offset\"] = offset
+    async with httpx.AsyncClient(timeout=40) as client:
+        r = await client.get(f\"{TELEGRAM_API}/getUpdates\", params=params)
+        return r.json()
+
+
+async def process_update(update):
+    message = update.get(\"message\", {})
+    text = message.get(\"text\", \"\")
+    chat_id = message.get(\"chat\", {}).get(\"id\")
+    user = message.get(\"from\", {})
+    author = f\"{user.get('first_name', '')} {user.get('last_name', '')}\".strip() or user.get(\"username\", \"Неизвестно\")
+
+    if not text or not chat_id:
+        return
 
     data = parse_report(text)
     if data is None:
-        return  # Не похоже на отчёт — игнорируем
+        return
 
     note = format_note(data, author, text)
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    safe_author = re.sub(r"[^\w\-]", "_", author)
-    filepath = f"%D0%9E%D1%82%D1%87%D1%91%D1%82%D1%8B/{today}_{safe_author}.md"
+    today = datetime.now().strftime(\"%Y-%m-%d\")
+    safe_author = re.sub(r\"[^\\w\\-]\", \"_\", author)
+    filepath = f\"Отчёты/{today}_{safe_author}.md\"
 
     success = await save_to_obsidian(note, filepath)
 
-    выручка = data.get("выручка", 0)
-    план = data.get("план", 0)
+    выручка = data.get(\"выручка\", 0)
+    план = data.get(\"план\", 0)
     процент = round(выручка / план * 100) if план > 0 else 0
-    статус = "✅" if процент >= 100 else "⚠️" if процент >= 80 else "🔴"
-
-    выручка_fmt = f"{выручка:,}".replace(",", " ")
+    статус = \"✅\" if процент >= 100 else \"⚠️\" if процент >= 80 else \"🔴\"
+    выручка_fmt = f\"{выручка:,}\".replace(\",\", \" \")
 
     if success:
-        await message.reply_text(
-            f"📥 Отчёт сохранён в Obsidian\n"
-            f"👤 {author}\n"
-            f"💰 Выручка: {выручка_fmt} ₽\n"
-            f"📊 План: {процент}% {статус}"
-        )
+        reply = f\"📥 Отчёт сохранён в Obsidian\
+👤 {author}\
+💰 Выручка: {выручка_fmt} ₽\
+📊 План: {процент}% {статус}\"
     else:
-        await message.reply_text(
-            "⚠️ Отчёт получен, но не удалось сохранить в Obsidian.\n"
-            "Проверь: Obsidian открыт? HTTP сервер включён? API ключ верный?"
-        )
+        reply = f\"📋 Отчёт получен\
+👤 {author}\
+💰 Выручка: {выручка_fmt} ₽\
+📊 План: {процент}% {статус}\
+⚠️ Obsidian недоступен\"
+
+    await send_message(chat_id, reply)
 
 
-# ─── Запуск ────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("✅ NextApple бот запущен...")
-    app.run_polling()
+async def main():
+    logger.info(\"✅ NextApple бот запущен (long polling)...\")
+    offset = None
+    while True:
+        try:
+            result = await get_updates(offset)
+            updates = result.get(\"result\", [])
+            for update in updates:
+                await process_update(update)
+                offset = update[\"update_id\"] + 1
+        except Exception as e:
+            logger.error(f\"Polling error: {e}\")
+            await asyncio.sleep(5)
+
+
+if __name__ == \"__main__\":
+    asyncio.run(main())
+",
+  "path": "/Users/vladrogov/Documents/Obsidian Vault/ИИ агенты/nextapple-bot/bot.py"
+}
+Response
+
+Successfully wrote to /Users/vladrogov/Documents/Obsidian Vault/ИИ агенты/nextapple-bot/bot.py

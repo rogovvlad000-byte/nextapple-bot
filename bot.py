@@ -186,10 +186,11 @@ def format_note(data, author, raw_text):
 
 async def save_to_obsidian(content, filepath):
     url = f"{OBSIDIAN_URL}/vault/{filepath}"
-    headers = {
-        "Authorization": f"Bearer {OBSIDIAN_API_KEY}",
-        "Content-Type": "text/markdown",
-    }
+   headers = {
+    "Authorization": f"Bearer {OBSIDIAN_API_KEY}",
+    "Content-Type": "text/markdown",
+    "ngrok-skip-browser-warning": "true",
+}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.put(url, content=content.encode("utf-8"), headers=headers)
